@@ -17,7 +17,7 @@
 #endif
 
 #define MAX_PREFIX_LEN 20  /* max length of file type prefix (e.g. 'http://') */
-#define MAX_DRIVERS 27     /* max number of file I/O drivers */
+#define MAX_DRIVERS 31     /* max number of file I/O drivers */
 
 typedef struct    /* structure containing pointers to I/O driver functions */ 
 {   char prefix[MAX_PREFIX_LEN];
@@ -1490,7 +1490,7 @@ int fits_already_open(fitsfile **fptr, /* I/O - FITS file pointer       */
     char oldbinspec[FLEN_FILENAME], oldcolspec[FLEN_FILENAME];
     char cwd[FLEN_FILENAME];
     char tmpStr[FLEN_FILENAME];
-    char tmpinfile[FLEN_FILENAME];
+    char tmpinfile[FLEN_FILENAME]; 
 
     *isopen = 0;
 
@@ -1508,7 +1508,8 @@ int fits_already_open(fitsfile **fptr, /* I/O - FITS file pointer       */
 
     if(fits_strcasecmp(urltype,"FILE://") == 0)
       {
-        fits_path2url(infile,tmpinfile,status);
+        if (fits_path2url(infile,FLEN_FILENAME,tmpinfile,status))
+           return (*status);
 
         if(tmpinfile[0] != '/')
           {
@@ -1546,7 +1547,8 @@ int fits_already_open(fitsfile **fptr, /* I/O - FITS file pointer       */
 
           if(fits_strcasecmp(oldurltype,"FILE://") == 0)
             {
-              fits_path2url(oldinfile,tmpStr,status);
+              if(fits_path2url(oldinfile,FLEN_FILENAME,tmpStr,status))
+                 return(*status);
               
               if(tmpStr[0] != '/')
                 {
@@ -1856,7 +1858,7 @@ int ffedit_columns(
     fitsfile *newptr;
     int ii, hdunum, slen, colnum = -1, testnum, deletecol = 0, savecol = 0;
     int numcols = 0, *colindex = 0, tstatus = 0;
-    char *cptr, *cptr2, *cptr3, *clause = NULL, keyname[FLEN_KEYWORD];
+    char *tstbuff=0, *cptr, *cptr2, *cptr3, *clause = NULL, keyname[FLEN_KEYWORD];
     char colname[FLEN_VALUE], oldname[FLEN_VALUE], colformat[FLEN_VALUE];
     char *file_expr = NULL, testname[FLEN_VALUE], card[FLEN_CARD];
 
@@ -1962,11 +1964,64 @@ int ffedit_columns(
 
         if (clause[0] == '!' || clause[0] == '-')
         {
+	    char *clause1 = clause+1;
+	    int clen = clause1[0] ? strlen(clause1) : 0;
             /* ===================================== */
             /* Case I. delete this column or keyword */
             /* ===================================== */
 
-            if (ffgcno(*fptr, CASEINSEN, &clause[1], &colnum, status) <= 0)
+	    /* Case Ia. delete column names with 0-or-more wildcard
+	            -COLNAME+ - delete repeated columns with exact name
+		    -COLNAM*+ - delete columns matching patterns
+	    */
+	    if (*status == 0 &&
+		clen > 1 && clause1[0] != '#' &&
+		clause1[clen-1] == '+') {
+
+	      clause1[clen-1] = 0; clen--;
+
+	      /* Note that this is a delete 0 or more specification,
+		 which means that no matching columns is not an error. */
+	      do {
+		int status_del = 0;
+
+		/* Have to set status=0 so we can reset the search at
+		   start column.  Because we are deleting columns on
+		   the fly here, we have to reset the search every
+		   time. The only penalty here is execution time
+		   because leaving *status == COL_NOT_UNIQUE is merely
+		   an optimization for tables assuming the tables do
+		   not change from one call to the next. (an
+		   assumption broken in this loop) */
+		*status = 0; 
+		ffgcno(*fptr, CASEINSEN, clause1, &colnum, status);
+		/* ffgcno returns COL_NOT_UNIQUE if there are multiple columns,
+		   and COL_NOT_FOUND after the last column is found, and 
+		   COL_NOT_FOUND if no matches were found */
+		if (*status != 0 && *status != COL_NOT_UNIQUE) break;
+		
+                if (ffdcol(*fptr, colnum, &status_del) > 0) {
+		  ffpmsg("failed to delete column in input file:");
+		  ffpmsg(clause);
+		  if( colindex ) free( colindex );
+		  if( file_expr ) free( file_expr );
+		  if( clause ) free(clause);
+		  return (*status = status_del);
+		}
+                deletecol = 1; /* set flag that at least one col was deleted */
+                numcols--;
+	      } while (*status == COL_NOT_UNIQUE);
+
+	      *status = 0; /* No matches are still successful */
+	      colnum = -1; /* Ignore the column we found */
+
+	    /* Case Ib. delete column names with wildcard or not
+	            -COLNAME  - deleted exact column
+		    -COLNAM*  - delete first column that matches pattern
+	       Note no leading '#'
+	    */
+	    } else if (clause1[0] && clause1[0] != '#' &&
+		ffgcno(*fptr, CASEINSEN, clause1, &colnum, status) <= 0)
             {
                 /* a column with this name exists, so try to delete it */
                 if (ffdcol(*fptr, colnum, status) > 0)
@@ -1982,20 +2037,65 @@ int ffedit_columns(
                 numcols--;
                 colnum = -1;
             }
+	    /* Case Ic. delete keyword(s)
+	            -KEYNAME,#KEYNAME  - delete exact keyword (first match)
+		    -KEYNAM*,#KEYNAM*  - delete first matching keyword
+		    -KEYNAME+,-#KEYNAME+ - delete 0-or-more exact matches of exact keyword
+		    -KEYNAM*+,-#KEYNAM*+ - delete 0-or-more wildcard matches 
+	       Note the preceding # is optional if no conflicting column name exists
+	       and that wildcard patterns are described in "colfilter" section of
+	       documentation.
+	    */
             else
             {
+	      int delall = 0;
+	      int haswild = 0;
 	        ffcmsg();   /* clear previous error message from ffgcno */
                 /* try deleting a keyword with this name */
                 *status = 0;
-                if (ffdkey(*fptr, &clause[1], status) > 0)
-                {
-                    ffpmsg("column or keyword to be deleted does not exist:");
-                    ffpmsg(clause);
-                    if( colindex ) free( colindex );
-                    if( file_expr ) free( file_expr );
-		    if( clause ) free(clause);
-                    return(*status);
-                }
+		/* skip past leading '#' if any */
+		if (clause1[0] == '#') clause1++;
+		clen = strlen(clause1);
+
+		/* Repeat deletion of keyword if requested with trailing '+' */
+		if (clen > 1 && clause1[clen-1] == '+') {
+		  delall = 1;
+		  clause1[clen-1] = 0;
+		}
+		/* Determine if this pattern has wildcards */
+		if (strchr(clause1,'?') || strchr(clause1,'*') || strchr(clause1,'#')) {
+		  haswild = 1;
+		}
+
+		if (haswild) {
+		  /* ffdkey() behaves differently if the pattern has a wildcard:
+		     it only checks from the "current" header position to the end, and doesn't
+		     check before the "current" header position.  Therefore, for the
+		     case of wildcards we will have to reset to the beginning. */
+		  ffmaky(*fptr, 1, status);  /* reset pointer to beginning of header */
+		}
+
+		/* Single or repeated deletions until done */
+		do {
+		  if (ffdkey(*fptr, clause1, status) > 0)
+		    {
+		      if (delall && *status == KEY_NO_EXIST) {
+			/* Found last wildcard item. Stop deleting */
+			ffcmsg();
+			*status = 0;
+			delall = 0; /* Force end of this loop */
+		      } else {
+			/* This was not a wildcard deletion, or it resulted in
+			   another kind of error */
+			ffpmsg("column or keyword to be deleted does not exist:");
+			ffpmsg(clause1);
+			if( colindex ) free( colindex );
+			if( file_expr ) free( file_expr );
+			if( clause ) free(clause);
+			return(*status);
+		      }
+		    }
+		} while(delall); /* end do{} */
             }
         }
         else
@@ -2011,17 +2111,32 @@ int ffedit_columns(
 	       calculation expression (case 2B) */
             /* ===================================================== */
             cptr2 = clause;
-            slen = fits_get_token(&cptr2, "( =", colname, NULL);
+            slen = fits_get_token2(&cptr2, "( =", &tstbuff, NULL, status);
 
-            if (slen == 0)
+            if (slen == 0 || *status)
             {
-                ffpmsg("error: column or keyword name is blank:");
+                ffpmsg("error: column or keyword name is blank (ffedit_columns):");
                 ffpmsg(clause);
                 if( colindex ) free( colindex );
                 if( file_expr ) free( file_expr );
 		if (clause) free(clause);
+                if (*status==0)
+                   *status=URL_PARSE_ERROR;
+                return(*status);
+            }
+            if (strlen(tstbuff) > FLEN_VALUE-1)
+            {
+                ffpmsg("error: column or keyword name is too long (ffedit_columns):");
+                ffpmsg(clause);
+                if( colindex ) free( colindex );
+                if( file_expr ) free( file_expr );
+		if (clause) free(clause);
+                free(tstbuff);
                 return(*status= URL_PARSE_ERROR);
             }
+            strcpy(colname, tstbuff);
+            free(tstbuff);
+            tstbuff=0;
 
 	    /* If this is a keyword of the form 
 	         #KEYWORD# 
@@ -2091,9 +2206,27 @@ int ffedit_columns(
             */
             if (*cptr2  == '(')
             {
-                fits_get_token(&cptr2, ")", oldname, NULL);
-                strcat(colname, oldname);
-                strcat(colname, ")");
+                if (fits_get_token2(&cptr2, ")", &tstbuff, NULL, status)==0)
+                {
+                   strcat(colname,")");
+                }
+                else
+                {
+                   if ((strlen(tstbuff) + strlen(colname) + 1) >
+                        FLEN_VALUE-1)
+                   {
+                      ffpmsg("error: column name is too long (ffedit_columns):");
+                      if( file_expr ) free( file_expr );
+		      if (clause) free(clause);
+                      free(tstbuff);
+                      *status=URL_PARSE_ERROR;
+		      return (*status);
+                   }
+                   strcat(colname, tstbuff);
+                   strcat(colname, ")");
+                   free(tstbuff);
+                   tstbuff=0;
+                }
                 cptr2++;
             }
 
@@ -2177,8 +2310,25 @@ int ffedit_columns(
                 while (*cptr2 == ' ')
                       cptr2++;       /* skip white space */
 
-                fits_get_token(&cptr2, " ", oldname, NULL);
-
+                if (fits_get_token2(&cptr2, " ", &tstbuff, NULL, status)==0)
+                {
+                   oldname[0]=0;
+                }
+                else
+                {
+                   if (strlen(tstbuff) > FLEN_VALUE-1)
+                   {
+                      ffpmsg("error: column name syntax is too long (ffedit_columns):");
+                      if( file_expr ) free( file_expr );
+		      if (clause) free(clause);
+                      free(tstbuff);
+                      *status=URL_PARSE_ERROR;
+		      return (*status);
+                   }
+                   strcpy(oldname, tstbuff);
+                   free(tstbuff);
+                   tstbuff=0;
+                }
                 /* get column number of the existing column */
                 if (ffgcno(*fptr, CASEINSEN, oldname, &colnum, status) <= 0)
                 {
@@ -2232,12 +2382,49 @@ int ffedit_columns(
                 colformat[0] = '\0';
                 cptr3 = colname;
 
-                fits_get_token(&cptr3, "(", oldname, NULL);
-
+                if (fits_get_token2(&cptr3, "(", &tstbuff, NULL, status)==0)
+                {
+                   oldname[0]=0;
+                }
+                else
+                {
+                   if (strlen(tstbuff) > FLEN_VALUE-1)
+                   {
+                         ffpmsg("column expression is too long (ffedit_columns)");
+                         if( colindex ) free( colindex );
+                         if( file_expr ) free( file_expr );
+		         if (clause) free(clause);
+                         free(tstbuff);
+                         *status=URL_PARSE_ERROR;
+                         return(*status);
+                   }
+                   strcpy(oldname, tstbuff);
+                   free(tstbuff);
+                   tstbuff=0;
+                }
                 if (cptr3[0] == '(' )
                 {
                    cptr3++;  /* skip the '(' */
-                   fits_get_token(&cptr3, ")", colformat, NULL);
+                   if (fits_get_token2(&cptr3, ")", &tstbuff, NULL, status)==0)
+                   {
+                      colformat[0]=0;
+                   }
+                   else
+                   {
+                      if (strlen(tstbuff) > FLEN_VALUE-1)
+                      {
+                            ffpmsg("column expression is too long (ffedit_columns)");
+                            if( colindex ) free( colindex );
+                            if( file_expr ) free( file_expr );
+		            if (clause) free(clause);
+                            free(tstbuff);
+                            *status=URL_PARSE_ERROR;
+                            return(*status);
+                      }
+                      strcpy(colformat, tstbuff);
+                      free(tstbuff);
+                      tstbuff=0;
+                   }
                 }
 
                 /* calculate values for the column or keyword */
@@ -3282,15 +3469,30 @@ int fits_get_section_range(char **ptr,
 */
 {
     int slen, isanumber;
-    char token[FLEN_VALUE];
+    char token[FLEN_VALUE], *tstbuff=0;
 
     if (*status > 0)
         return(*status);
 
-    slen = fits_get_token(ptr, " ,:", token, &isanumber); /* get 1st token */
-
-    /* support [:2,:2] type syntax, where the leading * is implied */
-    if (slen==0) strcpy(token,"*");
+    slen = fits_get_token2(ptr, " ,:", &tstbuff, &isanumber, status); /* get 1st token */
+    if (slen==0)
+    {
+       /* support [:2,:2] type syntax, where the leading * is implied */
+       strcpy(token,"*");
+    }
+    else
+    {
+       if (strlen(tstbuff) > FLEN_VALUE-1)
+       {
+          ffpmsg("Error: image section string too long (fits_get_section_range)");
+          free(tstbuff);
+          *status = URL_PARSE_ERROR;
+          return(*status);
+       }
+       strcpy(token, tstbuff);
+       free(tstbuff);
+       tstbuff=0;
+    }
 
     if (*token == '*')  /* wild card means to use the whole range */
     {
@@ -3311,10 +3513,23 @@ int fits_get_section_range(char **ptr,
       *secmin = atol(token);
 
       (*ptr)++;  /* skip the colon between the min and max values */
-      slen = fits_get_token(ptr, " ,:", token, &isanumber); /* get token */
-
+      slen = fits_get_token2(ptr, " ,:", &tstbuff, &isanumber, status); /* get token */
       if (slen == 0 || !isanumber)
-        return(*status = URL_PARSE_ERROR);   
+      {
+        if (tstbuff)
+           free(tstbuff);
+        return(*status = URL_PARSE_ERROR);  
+      } 
+      if (strlen(tstbuff) > FLEN_VALUE-1)
+      {
+         ffpmsg("Error: image section string too long (fits_get_section_range)");
+         free(tstbuff);
+         *status = URL_PARSE_ERROR;
+         return(*status);
+      }
+      strcpy(token, tstbuff);
+      free(tstbuff);
+      tstbuff=0;
 
       /* the token contains the max value */
       *secmax = atol(token);
@@ -3323,10 +3538,24 @@ int fits_get_section_range(char **ptr,
     if (**ptr == ':')
     {
         (*ptr)++;  /* skip the colon between the max and incre values */
-        slen = fits_get_token(ptr, " ,", token, &isanumber); /* get token */
-
+        slen = fits_get_token2(ptr, " ,", &tstbuff, &isanumber, status); /* get token */
         if (slen == 0 || !isanumber)
-            return(*status = URL_PARSE_ERROR);   
+        {
+            if (tstbuff)
+               free(tstbuff);
+            return(*status = URL_PARSE_ERROR); 
+        }  
+        if (strlen(tstbuff) > FLEN_VALUE-1)
+        {
+           ffpmsg("Error: image section string too long (fits_get_section_range)");
+           free(tstbuff);
+           *status = URL_PARSE_ERROR;
+           return(*status);
+        }
+        strcpy(token, tstbuff);
+        free(tstbuff);
+        tstbuff=0;
+
 
         *incre = atol(token);
     }
@@ -4856,6 +5085,116 @@ int fits_init_cfitsio(void)
         return(status);
     }
       /* === End of https net drivers section === */  
+
+    /* 28--------------------ftps  driver-----------------------*/
+    status = fits_register_driver("ftps://",
+            NULL,
+            mem_shutdown,
+            mem_setoptions,
+            mem_getoptions, 
+            mem_getversion,
+            ftps_checkfile,
+            ftps_open,
+            NULL,            
+            mem_truncate,
+            mem_close_free,
+            NULL,            
+            mem_size,
+            NULL,            
+            mem_seek,
+            mem_read,
+            mem_write);
+
+    if (status)
+    {
+        ffpmsg("failed to register the ftps:// driver (init_cfitsio)");
+        FFUNLOCK;
+        return(status);
+    }
+
+    /* 29--------------------ftps file driver-----------------------*/
+
+    status = fits_register_driver("ftpsfile://",
+            NULL,
+            file_shutdown,
+            file_setoptions,
+            file_getoptions, 
+            file_getversion,
+            NULL,             
+            ftps_file_open,
+            file_create,
+#ifdef HAVE_FTRUNCATE
+            file_truncate,
+#else
+            NULL,   
+#endif
+            file_close,
+            file_remove,
+            file_size,
+            file_flush,
+            file_seek,
+            file_read,
+            file_write);
+
+    if (status)
+    {
+        ffpmsg("failed to register the ftpsfile:// driver (init_cfitsio)");
+        FFUNLOCK;
+        return(status);
+    }
+
+    /* 30--------------------ftps memory driver-----------------------*/
+    /*  same as ftps:// driver, except memory file can be opened READWRITE */
+    status = fits_register_driver("ftpsmem://",
+            NULL,
+            mem_shutdown,
+            mem_setoptions,
+            mem_getoptions, 
+            mem_getversion,
+            ftps_checkfile,
+            ftps_file_open,  
+            NULL,            
+            mem_truncate,
+            mem_close_free,
+            NULL,           
+            mem_size,
+            NULL,            
+            mem_seek,
+            mem_read,
+            mem_write);
+
+    if (status)
+    {
+        ffpmsg("failed to register the ftpsmem:// driver (init_cfitsio)");
+        FFUNLOCK;
+        return(status);
+    }
+
+    /* 31--------------------ftps compressed file driver------------------*/
+    status = fits_register_driver("ftpscompress://",
+            NULL,
+            mem_shutdown,
+            mem_setoptions,
+            mem_getoptions, 
+            mem_getversion,
+            NULL,            /* checkfile not needed */ 
+            ftps_compress_open,
+            0,            /* create function not required */
+            mem_truncate,
+            mem_close_free,
+            0,            /* remove function not required */
+            mem_size,
+            0,            /* flush function not required */
+            mem_seek,
+            mem_read,
+            mem_write);
+
+    if (status)
+    {
+        ffpmsg("failed to register the ftpscompress:// driver (init_cfitsio)");
+        FFUNLOCK;
+        return(status);
+    }
 #endif
 
 
@@ -5063,9 +5402,14 @@ int ffifile2(char *url,       /* input filename */
            /* to the output file, and is not the urltype of the input file */
            ptr2 = 0;   /* so reset pointer to zero */
         }
-
+        
         if (ptr2)            /* copy the explicit urltype string */ 
         {
+            if (ptr2-ptr1+3 >= MAX_PREFIX_LEN)
+            {
+               ffpmsg("Name of urltype is too long.");
+               return(*status = URL_PARSE_ERROR);
+            }
             if (urltype)
                  strncat(urltype, ptr1, ptr2 - ptr1 + 3);
             ptr1 = ptr2 + 3;
@@ -7418,7 +7762,7 @@ int pixel_filter_helper(
 }
 
 /*-------------------------------------------------------------------*/
-int ffihtps()
+int ffihtps(void)
 {
    /* Wrapper function for global initialization of curl library.
       This is NOT THREAD-SAFE */
@@ -7432,7 +7776,7 @@ int ffihtps()
 }
 
 /*-------------------------------------------------------------------*/
-int ffchtps()
+int ffchtps(void)
 {
    /* Wrapper function for global cleanup of curl library.
       This is NOT THREAD-SAFE */
@@ -7453,3 +7797,40 @@ void ffvhtps(int flag)
 #endif
 }
 
+/*-------------------------------------------------------------------*/
+void ffshdwn(int flag)
+{
+   /* Display download status bar (to stderr), where applicable.
+      This is NOT THREAD-SAFE */
+#ifdef HAVE_NET_SERVICES
+   fits_dwnld_prog_bar(flag);
+#endif
+}
+
+/*-------------------------------------------------------------------*/
+int ffgtmo(void)
+{
+   int timeout=0;
+#ifdef HAVE_NET_SERVICES
+   timeout = fits_net_timeout(-1);
+#endif
+   return timeout;
+}
+
+/*-------------------------------------------------------------------*/
+int ffstmo(int sec, int *status)
+{
+   if (*status > 0)
+      return (*status);
+
+#ifdef HAVE_NET_SERVICES
+   if (sec <= 0)
+   {
+      *status = BAD_NETTIMEOUT;
+      ffpmsg("Bad value for net timeout setting (fits_set_timeout).");
+      return(*status);
+   }
+   fits_net_timeout(sec);
+#endif
+   return(*status);   
+}
